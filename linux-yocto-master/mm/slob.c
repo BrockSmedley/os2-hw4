@@ -2,9 +2,11 @@
 /*
  * SLOB Allocator: Simple List Of Blocks
  *
- * Matt Mackall <mpm@selenic.com> 12/30/03
+ * Matt Mackall <mpm@selenic.com> 12/30/03 
  *
  * NUMA support by Paul Mundt, 2007.
+ *
+ * Best-fit by Brock Smedley, June, 2018.
  *
  * How SLOB works:
  *
@@ -55,6 +57,20 @@
  * page flags. As a result, block allocations that can be satisfied from
  * the freelist will only be done so on pages residing on the same node,
  * in order to prevent random node placement.
+ *
+ * 
+ * How Best-fit works:
+ *
+ * At the page level, instead of choosing the first valid page we find,
+ * we keep a pointer to the best candidate. Iterating over every page by 
+ * way of a linked-list walk, we choose the page with the least available
+ * memory still meeting or exceeding our size requirement.
+ *
+ * At the block (slob block) level, the same concept applies, but we keep
+ * a pointer to the best-candidate memory chunk to use for our slob block.
+ *
+ * Once the respective loops finish, we simply use the default slob
+ * allocation behavior to allocate our new page/block.
  */
 
 #include <linux/kernel.h>
@@ -215,57 +231,97 @@ static void slob_free_pages(void *b, int order)
 /*
  * Allocate a slob block within a given slob_page sp.
  */
+/**************** MODIFY THIS TO MAKE THE BLOCKS FIT GOOD *****************/
 static void *slob_page_alloc(struct page *sp, size_t size, int align)
 {
 	slob_t *prev, *cur, *aligned = NULL;
-	int delta = 0, units = SLOB_UNITS(size);
+	int delta = 0;
+	int units = SLOB_UNITS(size);
 
+	int best_avail = -1;
+	slob_t *best_slob = NULL;
+	int best_delta = 0;
+
+	// First, search all the blocks in the page
 	for (prev = NULL, cur = sp->freelist; ; prev = cur, cur = slob_next(cur)) {
-		slobidx_t avail = slob_units(cur);
-
+	  	// cur points to newest entry in freelist
+		// gets size of available slob space -- use this to find best block location
+	  	slobidx_t avail = slob_units(cur);
+		
 		if (align) {
 			aligned = (slob_t *)ALIGN((unsigned long)cur, align);
 			delta = aligned - cur;
 		}
 		if (avail >= units + delta) { /* room enough? */
-			slob_t *next;
+			if (best_avail == -1 || avail < best_avail) {
+			  // found a new best slob spot
+			  best_avail = avail;
+			  best_slob = cur;
+			  best_delta = delta;
+		        }
 
+			slob_t *next;
 			if (delta) { /* need to fragment head to align? */
+				// point our slob block to next slob block 
+				// (pointed to by cur)
 				next = slob_next(cur);
+				// initialize SLOB block data on "aligned"
+				// size = avail - delta; (next = next;)
 				set_slob(aligned, avail - delta, next);
+				// create (head) fragment
 				set_slob(cur, delta, aligned);
 				prev = cur;
 				cur = aligned;
 				avail = slob_units(cur);
 			}
 
+			// CHECK THE NEXT SLOB SPOT FOR AVAILABILITY
 			next = slob_next(cur);
 			if (avail == units) { /* exact fit? unlink. */
+			  // layman's terms: we found a perfect fit, so 
+			  // our prev slob block needs to be updated to 
+			  // point to the next free spot
 				if (prev)
 					set_slob(prev, slob_units(prev), next);
+				// if prev doesn't exist, just point the page's 
+				// freelist to next
 				else
 					sp->freelist = next;
 			} else { /* fragment */
+			  // if we didn't find a perfect match, we'll have
+			  // to fragment the slob block; point "prev" at the
+			  // empty spot following our data
 				if (prev)
 					set_slob(prev, slob_units(prev), cur + units);
 				else
+				  // if prev doesn't exist, point freelist to that
+				  // empty spot
 					sp->freelist = cur + units;
+				// initialize a slob block at our new spot
 				set_slob(cur + units, avail - units, next);
 			}
 
+			// update the page
 			sp->units -= units;
+			// if page doesn't have any units, free it
 			if (!sp->units)
 				clear_slob_page_free(sp);
+			// return our slob block
 			return cur;
 		}
+		// if we end up at the last slob block, return NULL (can't alloc at the end!)
 		if (slob_last(cur))
+
 			return NULL;
 	}
+
+	// Then, choose best_whatever for our slob block
 }
 
 /*
  * slob_alloc: entry point into the slob allocator.
  */
+/***************** MODIFY THIS TO CHOOSE BEST PAGE FOR BLOCK(s) **************/
 static void *slob_alloc(size_t size, gfp_t gfp, int align, int node)
 {
 	struct page *sp;
